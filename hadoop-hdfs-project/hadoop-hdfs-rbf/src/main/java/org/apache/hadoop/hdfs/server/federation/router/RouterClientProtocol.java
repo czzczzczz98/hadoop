@@ -26,6 +26,7 @@ import org.apache.hadoop.fs.BatchedRemoteIterator.BatchedEntries;
 import org.apache.hadoop.fs.CacheFlag;
 import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.CreateFlag;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FsServerDefaults;
 import org.apache.hadoop.fs.Options;
 import org.apache.hadoop.fs.Path;
@@ -77,6 +78,7 @@ import org.apache.hadoop.hdfs.protocol.UnresolvedPathException;
 import org.apache.hadoop.hdfs.protocol.ZoneReencryptionStatus;
 import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSecretManager;
 import org.apache.hadoop.hdfs.server.federation.resolver.ActiveNamenodeResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.FederationNamespaceInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.FileSubclusterResolver;
@@ -85,11 +87,18 @@ import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
 import org.apache.hadoop.hdfs.server.federation.resolver.RouterResolveException;
 import org.apache.hadoop.hdfs.server.federation.router.security.RouterSecurityManager;
 import org.apache.hadoop.hdfs.server.federation.store.records.MountTable;
+import org.apache.hadoop.hdfs.server.namenode.AuditLogger;
+import org.apache.hadoop.hdfs.server.namenode.DefaultAuditLogger;
+import org.apache.hadoop.hdfs.server.namenode.HdfsAuditLogger;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
+import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeStorageReport;
 import org.apache.hadoop.io.EnumSetWritable;
 import org.apache.hadoop.io.Text;
+import org.apache.hadoop.ipc.CallerContext;
+import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.net.ConnectTimeoutException;
+import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.util.Time;
@@ -101,7 +110,9 @@ import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTest
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.ConnectException;
+import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
@@ -154,6 +165,13 @@ public class RouterClientProtocol implements ClientProtocol {
   private final RouterStoragePolicy storagePolicy;
   /** Snapshot calls. */
   private final RouterSnapshot snapshotProto;
+
+  // Tracks whether the default audit logger is the only configured audit
+  // logger; this allows isAuditEnabled() to return false in case the
+  // underlying logger is disabled, and avoid some unnecessary work.
+  private boolean isDefaultAuditLogger;
+  private final List<AuditLogger> auditLoggers;
+
   /** Router security manager to handle token operations. */
   private RouterSecurityManager securityManager = null;
 
@@ -190,13 +208,67 @@ public class RouterClientProtocol implements ClientProtocol {
     this.snapshotProto = new RouterSnapshot(rpcServer);
     this.routerCacheAdmin = new RouterCacheAdmin(rpcServer);
     this.securityManager = rpcServer.getRouterSecurityManager();
+    this.auditLoggers = RouterRpcServer.getAuditLogger();
+    this.isDefaultAuditLogger = auditLoggers.size() == 1
+        && auditLoggers.get(0) instanceof DefaultAuditLogger;
+  }
+
+  boolean isAuditEnabled() {
+    return (!isDefaultAuditLogger || RouterRpcServer.auditLog.isInfoEnabled())
+        && !auditLoggers.isEmpty();
+  }
+
+  void logAuditEvent(boolean succeeded, String cmd, String src)
+      throws IOException {
+    logAuditEvent(succeeded, cmd, src, null, null);
+  }
+
+  private void logAuditEvent(boolean succeeded, String cmd, String src,
+      String dst, FileStatus stat) throws IOException {
+    if (isAuditEnabled() && isExternalInvocation()) {
+      logAuditEvent(succeeded, Server.getRemoteUser(), Server.getRemoteIp(),
+          cmd, src, dst, stat);
+    }
+  }
+
+  private void logAuditEvent(boolean succeeded, UserGroupInformation ugi,
+      InetAddress addr, String cmd, String src, String dst,
+      FileStatus status) {
+    final String ugiStr = ugi.toString();
+    for (AuditLogger logger : auditLoggers) {
+      if (logger instanceof HdfsAuditLogger) {
+        HdfsAuditLogger hdfsLogger = (HdfsAuditLogger) logger;
+        hdfsLogger.logAuditEvent(succeeded, ugiStr, addr, cmd, src, dst,
+            status, CallerContext.getCurrent(), ugi, null);
+      } else {
+        logger.logAuditEvent(succeeded, ugiStr, addr, cmd, src, dst, status);
+      }
+    }
+  }
+
+  /**
+   * Client invoked methods are invoked over RPC and will be in RPC call
+   * context even if the client exits.
+   */
+  boolean isExternalInvocation() {
+    return Server.isRpcInvocation();
   }
 
   @Override
   public Token<DelegationTokenIdentifier> getDelegationToken(Text renewer)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE, true);
-    return this.securityManager.getDelegationToken(renewer);
+    Token<DelegationTokenIdentifier> token;
+    boolean success = false;
+    try {
+      token = this.securityManager.getDelegationToken(renewer);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, "getDelegationToken", null);
+      throw ace;
+    }
+    logAuditEvent(success, "getDelegationToken", null);
+    return token;
   }
 
   /**
@@ -216,14 +288,32 @@ public class RouterClientProtocol implements ClientProtocol {
   public long renewDelegationToken(Token<DelegationTokenIdentifier> token)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE, true);
-    return this.securityManager.renewDelegationToken(token);
+    long expiryTime;
+    boolean success = false;
+    try {
+      expiryTime = this.securityManager.renewDelegationToken(token);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, "renewDelegationToken", null);
+      throw ace;
+    }
+    logAuditEvent(success, "renewDelegationToken", null);
+    return expiryTime;
   }
 
   @Override
   public void cancelDelegationToken(Token<DelegationTokenIdentifier> token)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE, true);
-    this.securityManager.cancelDelegationToken(token);
+    boolean success = false;
+    try {
+      this.securityManager.cancelDelegationToken(token);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, "cancelDelegationToken", null);
+      throw ace;
+    }
+    logAuditEvent(success, "cancelDelegationToken", null);
     return;
   }
 
@@ -231,14 +321,24 @@ public class RouterClientProtocol implements ClientProtocol {
   public LocatedBlocks getBlockLocations(String src, final long offset,
       final long length) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
-
+    final String operationName = "open";
+    boolean success = false;
     List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
     RemoteMethod remoteMethod = new RemoteMethod("getBlockLocations",
         new Class<?>[] {String.class, long.class, long.class},
         new RemoteParam(), offset, length);
-    return rpcClient.invokeSequential(locations, remoteMethod,
-        LocatedBlocks.class, null);
+    LocatedBlocks blocks;
+    try {
+      blocks = rpcClient.invokeSequential(locations, remoteMethod,
+          LocatedBlocks.class, null);
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
+    }
+    logAuditEvent(success, operationName, src);
+    return blocks;
   }
 
   @Override
@@ -252,6 +352,7 @@ public class RouterClientProtocol implements ClientProtocol {
           rpcServer.invokeAtAvailableNs(method, FsServerDefaults.class);
       serverDefaultsLastUpdate = now;
     }
+    logAuditEvent(true, "getServerDefaults", null);
     return serverDefaults;
   }
 
@@ -286,15 +387,20 @@ public class RouterClientProtocol implements ClientProtocol {
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, true);
     RemoteLocation createLocation = null;
+    HdfsFileStatus hdfsFileStatus = null;
     try {
       createLocation = rpcServer.getCreateLocation(src);
-      return rpcClient.invokeSingle(createLocation, method,
+      hdfsFileStatus = rpcClient.invokeSingle(createLocation, method,
           HdfsFileStatus.class);
+      logAuditEvent(true, "create", src);
+      return  hdfsFileStatus;
     } catch (IOException ioe) {
       final List<RemoteLocation> newLocations = checkFaultTolerantRetry(
           method, src, ioe, createLocation, locations);
-      return rpcClient.invokeSequential(
+      hdfsFileStatus = rpcClient.invokeSequential(
           newLocations, method, HdfsFileStatus.class, null);
+      logAuditEvent(true, "create", src);
+      return hdfsFileStatus;
     }
   }
 
@@ -374,8 +480,16 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("append",
         new Class<?>[] {String.class, String.class, EnumSetWritable.class},
         new RemoteParam(), clientName, flag);
-    return rpcClient.invokeSequential(
-        locations, method, LastBlockWithStatus.class, null);
+    LastBlockWithStatus lbs = null;
+    try {
+      lbs = rpcClient.invokeSequential(locations, method, LastBlockWithStatus.class,
+          null);
+    } catch (AccessControlException e) {
+      logAuditEvent(false, "append", src);
+      throw e;
+    }
+    logAuditEvent(true, "append", src);
+    return lbs;
   }
 
   @Override
@@ -388,9 +502,17 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("recoverLease",
         new Class<?>[] {String.class, String.class}, new RemoteParam(),
         clientName);
-    Object result = rpcClient.invokeSequential(
-        locations, method, Boolean.class, null);
-    return (boolean) result;
+    boolean result;
+    String operationName = "recoverLease";
+    try {
+      result = rpcClient.invokeSequential(
+          locations, method, Boolean.class, null);
+    } catch (AccessControlException e) {
+      logAuditEvent(false, operationName, src);
+      throw e;
+    }
+    logAuditEvent(result, operationName, src);
+    return result;
   }
 
   @Override
@@ -402,19 +524,38 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("setReplication",
         new Class<?>[] {String.class, short.class}, new RemoteParam(),
         replication);
-    if (rpcServer.isInvokeConcurrent(src)) {
-      return !rpcClient.invokeConcurrent(locations, method, Boolean.class)
-          .containsValue(false);
-    } else {
-      return rpcClient.invokeSequential(locations, method, Boolean.class,
-          Boolean.TRUE);
+    boolean result = false;
+    try {
+      if (rpcServer.isInvokeConcurrent(src)) {
+        result = !rpcClient.invokeConcurrent(locations, method, Boolean.class)
+            .containsValue(false);
+      } else {
+        result = rpcClient.invokeSequential(locations, method, Boolean.class,
+            Boolean.TRUE);
+      }
+    } catch (AccessControlException e) {
+      logAuditEvent(result, "setReplication", src);
+      throw e;
     }
+    if (result) {
+      logAuditEvent(result, "setReplication", src);
+    }
+    return result;
   }
 
   @Override
   public void setStoragePolicy(String src, String policyName)
       throws IOException {
-    storagePolicy.setStoragePolicy(src, policyName);
+    final String operationName = "setStoragePolicy";
+    boolean success = false;
+    try {
+      storagePolicy.setStoragePolicy(src, policyName);
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
+    }
+    logAuditEvent(success, operationName, src, null, null);
   }
 
   @Override
@@ -437,6 +578,7 @@ public class RouterClientProtocol implements ClientProtocol {
     } else {
       rpcClient.invokeSequential(locations, method);
     }
+    logAuditEvent(true, "setPermission", src, null, null);
   }
 
   @Override
@@ -454,6 +596,7 @@ public class RouterClientProtocol implements ClientProtocol {
     } else {
       rpcClient.invokeSequential(locations, method);
     }
+    logAuditEvent(true, "setOwner", src, null, null);
   }
 
   /**
@@ -524,6 +667,7 @@ public class RouterClientProtocol implements ClientProtocol {
             String.class},
         b, fileId, new RemoteParam(), holder);
     rpcClient.invokeSingle(b, method);
+    logAuditEvent(true, "abandonBlock", src, null, null);
   }
 
   @Override
@@ -604,19 +748,29 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("rename",
         new Class<?>[] {String.class, String.class},
         new RemoteParam(), dstParam);
-    if (isMultiDestDirectory(src)) {
-      return rpcClient.invokeAll(locs, method);
-    } else {
-      return rpcClient.invokeSequential(locs, method, Boolean.class,
-          Boolean.TRUE);
+    boolean success = false;
+    try {
+      if (isMultiDestDirectory(src)) {
+        success = rpcClient.invokeAll(locs, method);
+      } else {
+        success = rpcClient.invokeSequential(locs, method, Boolean.class,
+            Boolean.TRUE);
+      }
+    } catch (AccessControlException e) {
+      logAuditEvent(success, "rename", src, dst, null);
+      throw e;
     }
+    if (success) {
+      logAuditEvent(success, "rename", src, dst, null);
+    }
+    return success;
   }
 
   @Override
   public void rename2(final String src, final String dst,
       final Options.Rename... options) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
-
+    final String operationName = "rename";
     final List<RemoteLocation> srcLocations =
         rpcServer.getLocationsForPath(src, true, false);
     // srcLocations may be trimmed by getRenameDestinations()
@@ -635,6 +789,8 @@ public class RouterClientProtocol implements ClientProtocol {
     } else {
       rpcClient.invokeSequential(locs, method, null, null);
     }
+    logAuditEvent(true, operationName + " (options=" +
+            Arrays.toString(options) + ")", src, dst, null);
   }
 
   @Override
@@ -679,7 +835,14 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("concat",
         new Class<?>[] {String.class, String[].class},
         targetDestination.getDest(), sourceDestinations);
-    rpcClient.invokeSingle(targetDestination, method, Void.class);
+    boolean success = false;
+    try {
+      rpcClient.invokeSingle(targetDestination, method, Void.class);
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, "concat", Arrays.toString(src), trg, null);
+      throw ace;
+    }
+    logAuditEvent(success, "concat", Arrays.toString(src), trg, null);
   }
 
   @Override
@@ -692,8 +855,16 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("truncate",
         new Class<?>[] {String.class, long.class, String.class},
         new RemoteParam(), newLength, clientName);
-    return rpcClient.invokeSequential(locations, method, Boolean.class,
-        Boolean.TRUE);
+    boolean success = false;
+    try {
+      success = rpcClient.invokeSequential(locations, method, Boolean.class,
+          Boolean.TRUE);
+    } catch (AccessControlException e) {
+      logAuditEvent(success, "truncate", src);
+      throw e;
+    }
+    logAuditEvent(success, "truncate", src, null, null);
+    return success;
   }
 
   @Override
@@ -704,13 +875,21 @@ public class RouterClientProtocol implements ClientProtocol {
         rpcServer.getLocationsForPath(src, true, false);
     RemoteMethod method = new RemoteMethod("delete",
         new Class<?>[] {String.class, boolean.class}, new RemoteParam(),
-        recursive);
-    if (rpcServer.isPathAll(src)) {
-      return rpcClient.invokeAll(locations, method);
-    } else {
-      return rpcClient.invokeSequential(locations, method,
-          Boolean.class, Boolean.TRUE);
+       recursive);
+    boolean success = false;
+    try {
+      if (rpcServer.isPathAll(src)) {
+        success = rpcClient.invokeAll(locations, method);
+      } else {
+        success = rpcClient.invokeSequential(locations, method, Boolean.class,
+            Boolean.TRUE);
+      }
+    } catch (AccessControlException e) {
+      logAuditEvent(success, "delete", src);
+      throw e;
     }
+    logAuditEvent(success, "delete", src);
+    return success;
   }
 
   @Override
@@ -745,14 +924,19 @@ public class RouterClientProtocol implements ClientProtocol {
     }
 
     final RemoteLocation firstLocation = locations.get(0);
+    boolean success = false;
     try {
-      return rpcClient.invokeSingle(firstLocation, method, Boolean.class);
+      success = rpcClient.invokeSingle(firstLocation, method, Boolean.class);
     } catch (IOException ioe) {
       final List<RemoteLocation> newLocations = checkFaultTolerantRetry(
           method, src, ioe, firstLocation, locations);
-      return rpcClient.invokeSequential(
+      success = rpcClient.invokeSequential(
           newLocations, method, Boolean.class, Boolean.TRUE);
+      logAuditEvent(success, "mkdirs", src);
+      throw ioe;
     }
+    logAuditEvent(success, "mkdirs", src, null, null);
+    return success;
   }
 
   @Override
@@ -762,7 +946,15 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("renewLease",
         new Class<?>[] {String.class}, clientName);
     Set<FederationNamespaceInfo> nss = namenodeResolver.getNamespaces();
-    rpcClient.invokeConcurrent(nss, method, false, false);
+    String operationName = "renewLease";
+    String invokeType = null;
+    try {
+      rpcClient.invokeConcurrent(nss, method, false, false);
+    } catch (AccessControlException e) {
+      logAuditEvent(false, operationName, null);
+      throw e;
+    }
+    logAuditEvent(true, operationName, null);
   }
 
   @Override
@@ -878,6 +1070,7 @@ public class RouterClientProtocol implements ClientProtocol {
     // Generate combined listing
     HdfsFileStatus[] combinedData = new HdfsFileStatus[nnListing.size()];
     combinedData = nnListing.values().toArray(combinedData);
+    logAuditEvent(true, "getListing", src);
     return new DirectoryListing(combinedData, remainingEntries);
   }
 
@@ -897,13 +1090,19 @@ public class RouterClientProtocol implements ClientProtocol {
         new Class<?>[] {String.class}, new RemoteParam());
 
     HdfsFileStatus ret = null;
-    // If it's a directory, we check in all locations
-    if (rpcServer.isPathAll(src)) {
-      ret = getFileInfoAll(locations, method);
-    } else {
-      // Check for file information sequentially
-      ret = rpcClient.invokeSequential(
-          locations, method, HdfsFileStatus.class, null);
+    String operationName = "getFileInfo";
+    try {
+      // If it's a directory, we check in all locations
+      if (rpcServer.isPathAll(src)) {
+        ret = getFileInfoAll(locations, method);
+      } else {
+        // Check for file information sequentially
+        ret = rpcClient.invokeSequential(
+            locations, method, HdfsFileStatus.class, null);
+      }
+    } catch (AccessControlException e) {
+      logAuditEvent(false, operationName, src);
+      throw e;
     }
 
     // If there is no real path, check mount points
@@ -922,6 +1121,7 @@ public class RouterClientProtocol implements ClientProtocol {
       }
     }
 
+    logAuditEvent(true, operationName, src);
     return ret;
   }
 
@@ -933,8 +1133,16 @@ public class RouterClientProtocol implements ClientProtocol {
         rpcServer.getLocationsForPath(src, false, false);
     RemoteMethod method = new RemoteMethod("isFileClosed",
         new Class<?>[] {String.class}, new RemoteParam());
-    return rpcClient.invokeSequential(locations, method, Boolean.class,
-        null);
+    boolean success = false;
+    try {
+      success = rpcClient.invokeSequential(locations, method, Boolean.class,
+          null);
+    } catch (AccessControlException e) {
+      logAuditEvent(success, "isFileClosed", src);
+      throw e;
+    }
+    logAuditEvent(success, "isFileClosed", src);
+    return success;
   }
 
   @Override
@@ -985,7 +1193,15 @@ public class RouterClientProtocol implements ClientProtocol {
   public DatanodeInfo[] getDatanodeReport(HdfsConstants.DatanodeReportType type)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.UNCHECKED);
-    return rpcServer.getDatanodeReport(type, true, 0);
+    DatanodeInfo[] arr;
+    try {
+      arr = rpcServer.getDatanodeReport(type, true, 0);
+    } catch (AccessControlException e) {
+      logAuditEvent(false, "datanodeReport", null);
+      throw e;
+    }
+    logAuditEvent(true, "datanodeReport", null);
+    return arr;
   }
 
   @Override
@@ -1016,6 +1232,7 @@ public class RouterClientProtocol implements ClientProtocol {
     DatanodeStorageReport[] combinedData =
         new DatanodeStorageReport[datanodes.size()];
     combinedData = datanodes.toArray(combinedData);
+    logAuditEvent(true, "getDatanodeStorageReport", null);
     return combinedData;
   }
 
@@ -1040,6 +1257,7 @@ public class RouterClientProtocol implements ClientProtocol {
         numSafemode++;
       }
     }
+    logAuditEvent(true, action.toString(), null);
     return numSafemode == results.size();
   }
 
@@ -1060,6 +1278,7 @@ public class RouterClientProtocol implements ClientProtocol {
         break;
       }
     }
+    logAuditEvent(true, "restoreFailedStorage", null);
     return success;
   }
 
@@ -1080,6 +1299,7 @@ public class RouterClientProtocol implements ClientProtocol {
         break;
       }
     }
+    logAuditEvent(true, "saveNamespace", null);
     return success;
   }
 
@@ -1099,6 +1319,7 @@ public class RouterClientProtocol implements ClientProtocol {
         txid = t;
       }
     }
+    logAuditEvent(true, "rollEdits", null);
     return txid;
   }
 
@@ -1109,6 +1330,7 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("refreshNodes", new Class<?>[] {});
     final Set<FederationNamespaceInfo> nss = namenodeResolver.getNamespaces();
     rpcClient.invokeConcurrent(nss, method, true, true);
+    logAuditEvent(true, "refreshNodes", null);
   }
 
   @Override
@@ -1119,6 +1341,7 @@ public class RouterClientProtocol implements ClientProtocol {
         new Class<?>[] {});
     final Set<FederationNamespaceInfo> nss = namenodeResolver.getNamespaces();
     rpcClient.invokeConcurrent(nss, method, true, false);
+    logAuditEvent(true, "finalizeRollingUpgrade", null);
   }
 
   @Override
@@ -1132,7 +1355,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public RollingUpgradeInfo rollingUpgrade(HdfsConstants.RollingUpgradeAction action)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
-
+    final String operationName = "queryRollingUpgrade";
     RemoteMethod method = new RemoteMethod("rollingUpgrade",
         new Class<?>[] {HdfsConstants.RollingUpgradeAction.class}, action);
     final Set<FederationNamespaceInfo> nss = namenodeResolver.getNamespaces();
@@ -1147,6 +1370,7 @@ public class RouterClientProtocol implements ClientProtocol {
         info = infoNs;
       }
     }
+    logAuditEvent(true, operationName, null, null, null);
     return info;
   }
 
@@ -1158,6 +1382,7 @@ public class RouterClientProtocol implements ClientProtocol {
         new Class<?>[] {String.class}, filename);
     final Set<FederationNamespaceInfo> nss = namenodeResolver.getNamespaces();
     rpcClient.invokeConcurrent(nss, method, true, false);
+    logAuditEvent(true, "metaSave", null);
   }
 
   @Override
@@ -1170,8 +1395,16 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("listCorruptFileBlocks",
         new Class<?>[] {String.class, String.class},
         new RemoteParam(), cookie);
-    return rpcClient.invokeSequential(
-        locations, method, CorruptFileBlocks.class, null);
+    String operationName = "listCorruptFileBlocks";
+    CorruptFileBlocks result = null;
+    try {
+      result = rpcClient.invokeSequential(
+          locations, method, CorruptFileBlocks.class, null);
+    } catch (AccessControlException e) {
+      logAuditEvent(false, operationName, path);
+    }
+    logAuditEvent(true, operationName, path);
+    return result;
   }
 
   @Override
@@ -1182,6 +1415,7 @@ public class RouterClientProtocol implements ClientProtocol {
         new Class<?>[] {long.class}, bandwidth);
     final Set<FederationNamespaceInfo> nss = namenodeResolver.getNamespaces();
     rpcClient.invokeConcurrent(nss, method, true, false);
+    logAuditEvent(true, "setBalancerBandwidth", null);
   }
 
   @Override
@@ -1231,10 +1465,13 @@ public class RouterClientProtocol implements ClientProtocol {
 
     // Throw original exception if no original nor mount points
     if (summaries.isEmpty() && notFoundException != null) {
+      logAuditEvent(false, "contentSummary", path);
       throw notFoundException;
     }
 
-    return aggregateContentSummary(summaries);
+    ContentSummary ret = aggregateContentSummary(summaries);
+    logAuditEvent(true, "contentSummary", path);
+    return ret;
   }
 
   @Override
@@ -1259,7 +1496,14 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("setTimes",
         new Class<?>[] {String.class, long.class, long.class},
         new RemoteParam(), mtime, atime);
-    rpcClient.invokeSequential(locations, method);
+    FileStatus auditStat = null;
+    try {
+      auditStat = (FileStatus) rpcClient.invokeSequential(locations, method);
+    } catch (AccessControlException e) {
+      logAuditEvent(false, "setTimes", src);
+      throw e;
+    }
+    logAuditEvent(true, "setTimes", src, null, auditStat);
   }
 
   @Override
@@ -1277,7 +1521,13 @@ public class RouterClientProtocol implements ClientProtocol {
         new Class<?>[] {String.class, String.class, FsPermission.class,
             boolean.class},
         new RemoteParam(), linkLocation.getDest(), dirPerms, createParent);
-    rpcClient.invokeSequential(targetLocations, method);
+    try {
+      rpcClient.invokeSequential(targetLocations, method);
+    } catch (AccessControlException e) {
+      logAuditEvent(false, "createSymlink", link, target, null);
+      throw e;
+    }
+    logAuditEvent(true, "createSymlink", link, target, null);
   }
 
   @Override
@@ -1288,95 +1538,265 @@ public class RouterClientProtocol implements ClientProtocol {
         rpcServer.getLocationsForPath(path, false, false);
     RemoteMethod method = new RemoteMethod("getLinkTarget",
         new Class<?>[] {String.class}, new RemoteParam());
-    return rpcClient.invokeSequential(locations, method, String.class, null);
+    String operationName = "getLinkTarget";
+    String result;
+    try {
+      result =
+          rpcClient.invokeSequential(locations, method, String.class, null);
+    } catch (AccessControlException e) {
+      logAuditEvent(false, operationName, path);
+      throw e;
+    }
+    logAuditEvent(true, operationName, path);
+    return result;
   }
 
   @Override
   public void allowSnapshot(String snapshotRoot) throws IOException {
     snapshotProto.allowSnapshot(snapshotRoot);
+    logAuditEvent(true, "allowSnapshot", snapshotRoot, null, null);
   }
 
   @Override
   public void disallowSnapshot(String snapshot) throws IOException {
     snapshotProto.disallowSnapshot(snapshot);
+    logAuditEvent(true, "disallowSnapshot", snapshot, null, null);
   }
 
   @Override
   public void renameSnapshot(String snapshotRoot, String snapshotOldName,
       String snapshotNewName) throws IOException {
-    snapshotProto.renameSnapshot(
-        snapshotRoot, snapshotOldName, snapshotNewName);
+    final String operationName = "renameSnapshot";
+    boolean success = false;
+    String oldSnapshotRoot =
+        Snapshot.getSnapshotPath(snapshotRoot, snapshotOldName);
+    String newSnapshotRoot =
+        Snapshot.getSnapshotPath(snapshotRoot, snapshotNewName);
+    try {
+      snapshotProto.renameSnapshot(snapshotRoot, snapshotOldName,
+          snapshotNewName);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, oldSnapshotRoot, newSnapshotRoot,
+          null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, oldSnapshotRoot, newSnapshotRoot,
+        null);
   }
 
   @Override
   public SnapshottableDirectoryStatus[] getSnapshottableDirListing()
       throws IOException {
-    return snapshotProto.getSnapshottableDirListing();
+    rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    final String operationName = "listSnapshottableDirectory";
+    SnapshottableDirectoryStatus[] status = null;
+    boolean success = false;
+    try {
+      status = snapshotProto.getSnapshottableDirListing();
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, null, null, null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, null, null, null);
+    return status;
   }
 
   @Override
   public SnapshotDiffReport getSnapshotDiffReport(String snapshotRoot,
       String earlierSnapshotName, String laterSnapshotName) throws IOException {
-    return snapshotProto.getSnapshotDiffReport(
-        snapshotRoot, earlierSnapshotName, laterSnapshotName);
+    rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    final String operationName = "computeSnapshotDiff";
+    SnapshotDiffReport diffs = null;
+    boolean success = false;
+    String fromSnapshotRoot =
+        (earlierSnapshotName == null || earlierSnapshotName.isEmpty())
+            ? snapshotRoot
+            : Snapshot.getSnapshotPath(snapshotRoot, earlierSnapshotName);
+    String toSnapshotRoot =
+        (laterSnapshotName == null || laterSnapshotName.isEmpty())
+            ? snapshotRoot
+            : Snapshot.getSnapshotPath(snapshotRoot, laterSnapshotName);
+    try {
+      diffs = snapshotProto.getSnapshotDiffReport(snapshotRoot,
+          earlierSnapshotName, laterSnapshotName);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, fromSnapshotRoot, toSnapshotRoot,
+          null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, fromSnapshotRoot, toSnapshotRoot,
+        null);
+    return diffs;
   }
 
   @Override
   public SnapshotDiffReportListing getSnapshotDiffReportListing(
       String snapshotRoot, String earlierSnapshotName, String laterSnapshotName,
       byte[] startPath, int index) throws IOException {
-    return snapshotProto.getSnapshotDiffReportListing(
-        snapshotRoot, earlierSnapshotName, laterSnapshotName, startPath, index);
+    rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    final String operationName = "computeSnapshotDiff";
+    SnapshotDiffReportListing diffs = null;
+    boolean success = false;
+    String fromSnapshotRoot =
+        (earlierSnapshotName == null || earlierSnapshotName.isEmpty())
+            ? snapshotRoot
+            : Snapshot.getSnapshotPath(snapshotRoot, earlierSnapshotName);
+    String toSnapshotRoot =
+        (laterSnapshotName == null || laterSnapshotName.isEmpty())
+            ? snapshotRoot
+            : Snapshot.getSnapshotPath(snapshotRoot, laterSnapshotName);
+    try {
+      diffs = snapshotProto.getSnapshotDiffReportListing(snapshotRoot,
+          earlierSnapshotName, laterSnapshotName, startPath, index);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, fromSnapshotRoot, toSnapshotRoot,
+          null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, fromSnapshotRoot, toSnapshotRoot,
+        null);
+    return diffs;
   }
 
   @Override
   public long addCacheDirective(CacheDirectiveInfo path,
       EnumSet<CacheFlag> flags) throws IOException {
-    return routerCacheAdmin.addCacheDirective(path, flags);
+    final String operationName = "addCacheDirective";
+    boolean success = false;
+    long dirId;
+    try {
+      dirId = routerCacheAdmin.addCacheDirective(path, flags);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, null, null, null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, null, null, null);
+    return dirId;
   }
 
   @Override
   public void modifyCacheDirective(CacheDirectiveInfo directive,
       EnumSet<CacheFlag> flags) throws IOException {
-    routerCacheAdmin.modifyCacheDirective(directive, flags);
+    final String operationName = "modifyCacheDirective";
+    boolean success = false;
+    final String idStr = "{id: " + directive.getId() + "}";
+    try {
+      routerCacheAdmin.modifyCacheDirective(directive, flags);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, idStr, directive.toString(), null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, idStr, directive.toString(), null);
   }
 
   @Override
   public void removeCacheDirective(long id) throws IOException {
-    routerCacheAdmin.removeCacheDirective(id);
+    final String operationName = "removeCacheDirective";
+    boolean success = false;
+    String idStr = "{id: " + Long.toString(id) + "}";
+    try {
+      routerCacheAdmin.removeCacheDirective(id);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, idStr, null, null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, idStr, null, null);
   }
 
   @Override
   public BatchedEntries<CacheDirectiveEntry> listCacheDirectives(long prevId,
       CacheDirectiveInfo filter) throws IOException {
-    return routerCacheAdmin.listCacheDirectives(prevId, filter);
+    final String operationName = "listCacheDirectives";
+    BatchedEntries<CacheDirectiveEntry> results;
+    boolean success = false;
+    try {
+      results = routerCacheAdmin.listCacheDirectives(prevId, filter);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, filter.toString(), null, null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, filter.toString(), null, null);
+    return results;
   }
 
   @Override
   public void addCachePool(CachePoolInfo info) throws IOException {
-    routerCacheAdmin.addCachePool(info);
+    final String operationName = "addCachePool";
+    boolean success = false;
+    try {
+      routerCacheAdmin.addCachePool(info);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, null, null, null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, null, null, null);
   }
 
   @Override
   public void modifyCachePool(CachePoolInfo info) throws IOException {
-    routerCacheAdmin.modifyCachePool(info);
+    final String operationName = "modifyCachePool";
+    boolean success = false;
+    String poolNameStr =
+        "{poolName: " + (info == null ? null : info.getPoolName()) + "}";
+    try {
+      routerCacheAdmin.modifyCachePool(info);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, poolNameStr,
+          info == null ? null : info.toString(), null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, poolNameStr,
+        info == null ? null : info.toString(), null);
   }
 
   @Override
   public void removeCachePool(String cachePoolName) throws IOException {
-    routerCacheAdmin.removeCachePool(cachePoolName);
+    final String operationName = "removeCachePool";
+    boolean success = false;
+    String poolNameStr = "{poolName: " + cachePoolName + "}";
+    try {
+      routerCacheAdmin.removeCachePool(cachePoolName);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, poolNameStr, null, null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, poolNameStr, null, null);
   }
 
   @Override
   public BatchedEntries<CachePoolEntry> listCachePools(String prevKey)
       throws IOException {
-    return routerCacheAdmin.listCachePools(prevKey);
+    final String operationName = "listCachePools";
+    BatchedEntries<CachePoolEntry> results;
+    boolean success = false;
+    try {
+      results = routerCacheAdmin.listCachePools(prevKey);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, null, null, null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, null, null, null);
+    return results;
   }
 
   @Override
   public void modifyAclEntries(String src, List<AclEntry> aclSpec)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    final String operationName = "modifyAclEntries";
+    boolean success = false;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
@@ -1384,17 +1804,26 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("modifyAclEntries",
         new Class<?>[] {String.class, List.class},
         new RemoteParam(), aclSpec);
-    if (rpcServer.isInvokeConcurrent(src)) {
-      rpcClient.invokeConcurrent(locations, method);
-    } else {
-      rpcClient.invokeSequential(locations, method);
+    try {
+      if (rpcServer.isInvokeConcurrent(src)) {
+        rpcClient.invokeConcurrent(locations, method);
+      } else {
+        rpcClient.invokeSequential(locations, method);
+      }
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
     }
+    logAuditEvent(success, operationName, src, null, null);
   }
 
   @Override
   public void removeAclEntries(String src, List<AclEntry> aclSpec)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    final String operationName = "removeAclEntries";
+    boolean success = false;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
@@ -1402,48 +1831,75 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("removeAclEntries",
         new Class<?>[] {String.class, List.class},
         new RemoteParam(), aclSpec);
-    if (rpcServer.isInvokeConcurrent(src)) {
-      rpcClient.invokeConcurrent(locations, method);
-    } else {
-      rpcClient.invokeSequential(locations, method);
+    try {
+      if (rpcServer.isInvokeConcurrent(src)) {
+        rpcClient.invokeConcurrent(locations, method);
+      } else {
+        rpcClient.invokeSequential(locations, method);
+      }
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
     }
+    logAuditEvent(success, operationName, src, null, null);
   }
 
   @Override
   public void removeDefaultAcl(String src) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    final String operationName = "removeDefaultAcl";
+    boolean success = false;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
     RemoteMethod method = new RemoteMethod("removeDefaultAcl",
         new Class<?>[] {String.class}, new RemoteParam());
-    if (rpcServer.isInvokeConcurrent(src)) {
-      rpcClient.invokeConcurrent(locations, method);
-    } else {
-      rpcClient.invokeSequential(locations, method);
+    try {
+      if (rpcServer.isInvokeConcurrent(src)) {
+        rpcClient.invokeConcurrent(locations, method);
+      } else {
+        rpcClient.invokeSequential(locations, method);
+      }
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
     }
+    logAuditEvent(success, operationName, src, null, null);
   }
 
   @Override
   public void removeAcl(String src) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    final String operationName = "removeAcl";
+    boolean success = false;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
     RemoteMethod method = new RemoteMethod("removeAcl",
         new Class<?>[] {String.class}, new RemoteParam());
-    if (rpcServer.isInvokeConcurrent(src)) {
-      rpcClient.invokeConcurrent(locations, method);
-    } else {
-      rpcClient.invokeSequential(locations, method);
+    try {
+      if (rpcServer.isInvokeConcurrent(src)) {
+        rpcClient.invokeConcurrent(locations, method);
+      } else {
+        rpcClient.invokeSequential(locations, method);
+      }
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
     }
+    logAuditEvent(success, operationName, src, null, null);
   }
 
   @Override
   public void setAcl(String src, List<AclEntry> aclSpec) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    final String operationName = "setAcl";
+    boolean success = false;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
@@ -1451,29 +1907,50 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod(
         "setAcl", new Class<?>[] {String.class, List.class},
         new RemoteParam(), aclSpec);
-    if (rpcServer.isInvokeConcurrent(src)) {
-      rpcClient.invokeConcurrent(locations, method);
-    } else {
-      rpcClient.invokeSequential(locations, method);
+    try {
+      if (rpcServer.isInvokeConcurrent(src)) {
+        rpcClient.invokeConcurrent(locations, method);
+      } else {
+        rpcClient.invokeSequential(locations, method);
+      }
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
     }
+    logAuditEvent(success, operationName, src, null, null);
   }
 
   @Override
   public AclStatus getAclStatus(String src) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    final String operationName = "getAclStatus";
+    boolean success = false;
+    final AclStatus ret;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
     RemoteMethod method = new RemoteMethod("getAclStatus",
         new Class<?>[] {String.class}, new RemoteParam());
-    return rpcClient.invokeSequential(locations, method, AclStatus.class, null);
+    try {
+      ret =
+          rpcClient.invokeSequential(locations, method, AclStatus.class, null);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, src);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, src);
+    return ret;
   }
 
   @Override
   public void createEncryptionZone(String src, String keyName)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    final String operationName = "createEncryptionZone";
+    boolean success = false;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
@@ -1481,39 +1958,77 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("createEncryptionZone",
         new Class<?>[] {String.class, String.class},
         new RemoteParam(), keyName);
-    rpcClient.invokeSequential(locations, method);
+    try {
+      rpcClient.invokeSequential(locations, method);
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
+    }
+    logAuditEvent(success, operationName, src, null, null);
   }
 
   @Override
   public EncryptionZone getEZForPath(String src) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    final String operationName = "getEZForPath";
+    boolean success = false;
+    EncryptionZone encryptionZone;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
     RemoteMethod method = new RemoteMethod("getEZForPath",
         new Class<?>[] {String.class}, new RemoteParam());
-    return rpcClient.invokeSequential(
-        locations, method, EncryptionZone.class, null);
+    try {
+      encryptionZone = rpcClient.invokeSequential(locations, method,
+          EncryptionZone.class, null);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, src, null, null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, src, null, null);
+    return encryptionZone;
   }
 
   @Override
   public BatchedEntries<EncryptionZone> listEncryptionZones(long prevId)
       throws IOException {
-    rpcServer.checkOperation(NameNode.OperationCategory.READ, false);
+    final String operationName = "listEncryptionZones";
+    boolean success = false;
+    try {
+      rpcServer.checkOperation(NameNode.OperationCategory.READ, false);
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, null);
+    }
     return null;
   }
 
   @Override
   public void reencryptEncryptionZone(String zone, HdfsConstants.ReencryptAction action)
       throws IOException {
-    rpcServer.checkOperation(NameNode.OperationCategory.WRITE, false);
+    boolean success = false;
+    try {
+      rpcServer.checkOperation(NameNode.OperationCategory.WRITE, false);
+      success = true;
+    } finally {
+      logAuditEvent(success, action + "reencryption", zone, null, null);
+    }
   }
 
   @Override
   public BatchedEntries<ZoneReencryptionStatus> listReencryptionStatus(
       long prevId) throws IOException {
-    rpcServer.checkOperation(NameNode.OperationCategory.READ, false);
+    final String operationName = "listReencryptionStatus";
+    boolean success = false;
+    try {
+      rpcServer.checkOperation(NameNode.OperationCategory.READ, false);
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, null);
+    }
     return null;
   }
 
@@ -1521,6 +2036,8 @@ public class RouterClientProtocol implements ClientProtocol {
   public void setXAttr(String src, XAttr xAttr, EnumSet<XAttrSetFlag> flag)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    final String operationName = "setXAttr";
+    boolean success = false;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
@@ -1528,11 +2045,18 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("setXAttr",
         new Class<?>[] {String.class, XAttr.class, EnumSet.class},
         new RemoteParam(), xAttr, flag);
-    if (rpcServer.isInvokeConcurrent(src)) {
-      rpcClient.invokeConcurrent(locations, method);
-    } else {
-      rpcClient.invokeSequential(locations, method);
+    try {
+      if (rpcServer.isInvokeConcurrent(src)) {
+        rpcClient.invokeConcurrent(locations, method);
+      } else {
+        rpcClient.invokeSequential(locations, method);
+      }
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
     }
+    logAuditEvent(success, operationName, src, null, null);
   }
 
   @SuppressWarnings("unchecked")
@@ -1540,49 +2064,81 @@ public class RouterClientProtocol implements ClientProtocol {
   public List<XAttr> getXAttrs(String src, List<XAttr> xAttrs)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    final String operationName = "getXAttrs";
+    boolean success = false;
+    List<XAttr> fsXattrs;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
     RemoteMethod method = new RemoteMethod("getXAttrs",
         new Class<?>[] {String.class, List.class}, new RemoteParam(), xAttrs);
-    return (List<XAttr>) rpcClient.invokeSequential(
-        locations, method, List.class, null);
+    try {
+      fsXattrs = (List<XAttr>) rpcClient.invokeSequential(locations, method,
+          List.class, null);
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
+    }
+    logAuditEvent(success, operationName, src);
+    return fsXattrs;
   }
 
   @SuppressWarnings("unchecked")
   @Override
   public List<XAttr> listXAttrs(String src) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
-
+    final String operationName = "listXAttrs";
+    boolean success = false;
+    List<XAttr> fsXattrs;
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
     RemoteMethod method = new RemoteMethod("listXAttrs",
         new Class<?>[] {String.class}, new RemoteParam());
-    return (List<XAttr>) rpcClient.invokeSequential(
-        locations, method, List.class, null);
+    try {
+      fsXattrs = (List<XAttr>) rpcClient.invokeSequential(locations, method,
+          List.class, null);
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
+    }
+    logAuditEvent(success, operationName, src, null, null);
+    return fsXattrs;
   }
 
   @Override
   public void removeXAttr(String src, XAttr xAttr) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    final String operationName = "removeXAttr";
+    boolean success = false;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
     RemoteMethod method = new RemoteMethod("removeXAttr",
         new Class<?>[] {String.class, XAttr.class}, new RemoteParam(), xAttr);
-    if (rpcServer.isInvokeConcurrent(src)) {
-      rpcClient.invokeConcurrent(locations, method);
-    } else {
-      rpcClient.invokeSequential(locations, method);
+    try {
+      if (rpcServer.isInvokeConcurrent(src)) {
+        rpcClient.invokeConcurrent(locations, method);
+      } else {
+        rpcClient.invokeSequential(locations, method);
+      }
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, src);
+      throw e;
     }
+    logAuditEvent(success, operationName, src, null, null);
   }
 
   @Override
   public void checkAccess(String path, FsAction mode) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    final String operationName = "checkAccess";
+    boolean success = false;
 
     // TODO handle virtual directories
     final List<RemoteLocation> locations =
@@ -1590,7 +2146,14 @@ public class RouterClientProtocol implements ClientProtocol {
     RemoteMethod method = new RemoteMethod("checkAccess",
         new Class<?>[] {String.class, FsAction.class},
         new RemoteParam(), mode);
-    rpcClient.invokeSequential(locations, method);
+    try {
+      rpcClient.invokeSequential(locations, method);
+      success = true;
+    } catch (AccessControlException e) {
+      logAuditEvent(success, operationName, path);
+      throw e;
+    }
+    logAuditEvent(success, operationName, path);
   }
 
   @Override
@@ -1628,25 +2191,59 @@ public class RouterClientProtocol implements ClientProtocol {
   @Override
   public String createSnapshot(String snapshotRoot, String snapshotName)
       throws IOException {
-    return snapshotProto.createSnapshot(snapshotRoot, snapshotName);
+    String snapshotPath = null;
+    boolean success = false;
+    final String operationName = "createSnapshot";
+    try {
+      snapshotPath = snapshotProto.createSnapshot(snapshotRoot, snapshotName);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, snapshotRoot, snapshotPath, null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, snapshotRoot, snapshotPath, null);
+    return snapshotPath;
   }
 
   @Override
   public void deleteSnapshot(String snapshotRoot, String snapshotName)
       throws IOException {
-    snapshotProto.deleteSnapshot(snapshotRoot, snapshotName);
+    final String operationName = "deleteSnapshot";
+    boolean success = false;
+    try {
+      snapshotProto.deleteSnapshot(snapshotRoot, snapshotName);
+      success = true;
+    } catch (AccessControlException ace) {
+      logAuditEvent(success, operationName, null, null, null);
+      throw ace;
+    }
+    logAuditEvent(success, operationName, null, null, null);
   }
 
   @Override
   public void setQuota(String path, long namespaceQuota, long storagespaceQuota,
       StorageType type) throws IOException {
-    rpcServer.getQuotaModule()
-        .setQuota(path, namespaceQuota, storagespaceQuota, type, true);
+    try {
+      rpcServer.getQuotaModule()
+          .setQuota(path, namespaceQuota, storagespaceQuota, type, true);
+    } catch (AccessControlException ace) {
+      logAuditEvent(false, "setQuota", path);
+      throw ace;
+    }
+    logAuditEvent(true, "setQuota", path);
   }
 
   @Override
   public QuotaUsage getQuotaUsage(String path) throws IOException {
-    return rpcServer.getQuotaModule().getQuotaUsage(path);
+    QuotaUsage quotaUsage;
+    try {
+      quotaUsage = rpcServer.getQuotaModule().getQuotaUsage(path);
+    } catch (AccessControlException ace) {
+      logAuditEvent(false, "quotaUsage", path);
+      throw ace;
+    }
+    logAuditEvent(true, "quotaUsage", path);
+    return quotaUsage;
   }
 
   @Override
@@ -1682,6 +2279,7 @@ public class RouterClientProtocol implements ClientProtocol {
   @Override
   public void unsetStoragePolicy(String src) throws IOException {
     storagePolicy.unsetStoragePolicy(src);
+    logAuditEvent(true, "unsetStoragePolicy", src, null, null);
   }
 
   @Override
@@ -1692,53 +2290,124 @@ public class RouterClientProtocol implements ClientProtocol {
   @Override
   public ErasureCodingPolicyInfo[] getErasureCodingPolicies()
       throws IOException {
-    return erasureCoding.getErasureCodingPolicies();
+    final String operationName = "getErasureCodingPolicies";
+    boolean success = false;
+    final ErasureCodingPolicyInfo[] ret;
+    try {
+      ret = erasureCoding.getErasureCodingPolicies();
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, null);
+    }
+    return ret;
   }
 
   @Override
   public Map<String, String> getErasureCodingCodecs() throws IOException {
-    return erasureCoding.getErasureCodingCodecs();
+    final String operationName = "getErasureCodingCodecs";
+    boolean success = false;
+    final Map<String, String> ret;
+    try {
+      ret = erasureCoding.getErasureCodingCodecs();
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, null);
+    }
+    return ret;
   }
 
   @Override
   public AddErasureCodingPolicyResponse[] addErasureCodingPolicies(
       ErasureCodingPolicy[] policies) throws IOException {
-    return erasureCoding.addErasureCodingPolicies(policies);
+    final String operationName = "addErasureCodingPolicies";
+    boolean success = false;
+    AddErasureCodingPolicyResponse[] responses;
+    try {
+      responses = erasureCoding.addErasureCodingPolicies(policies);
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, null, null, null);
+    }
+    return responses;
   }
 
   @Override
   public void removeErasureCodingPolicy(String ecPolicyName)
       throws IOException {
-    erasureCoding.removeErasureCodingPolicy(ecPolicyName);
+    final String operationName = "removeErasureCodingPolicy";
+    boolean success = false;
+    try {
+      erasureCoding.removeErasureCodingPolicy(ecPolicyName);
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, ecPolicyName, null, null);
+    }
   }
 
   @Override
   public void disableErasureCodingPolicy(String ecPolicyName)
       throws IOException {
-    erasureCoding.disableErasureCodingPolicy(ecPolicyName);
+    final String operationName = "disableErasureCodingPolicy";
+    boolean success = false;
+    try {
+      erasureCoding.disableErasureCodingPolicy(ecPolicyName);
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, ecPolicyName, null, null);
+    }
   }
 
   @Override
   public void enableErasureCodingPolicy(String ecPolicyName)
       throws IOException {
-    erasureCoding.enableErasureCodingPolicy(ecPolicyName);
+    final String operationName = "enableErasureCodingPolicy";
+    boolean success = false;
+    try {
+      erasureCoding.enableErasureCodingPolicy(ecPolicyName);
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, ecPolicyName, null, null);
+    }
   }
 
   @Override
   public ErasureCodingPolicy getErasureCodingPolicy(String src)
       throws IOException {
-    return erasureCoding.getErasureCodingPolicy(src);
+    final String operationName = "getErasureCodingPolicy";
+    boolean success = false;
+    final ErasureCodingPolicy ret;
+    try {
+      ret = erasureCoding.getErasureCodingPolicy(src);
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, null);
+    }
+    return ret;
   }
 
   @Override
   public void setErasureCodingPolicy(String src, String ecPolicyName)
       throws IOException {
-    erasureCoding.setErasureCodingPolicy(src, ecPolicyName);
+    final String operationName = "setErasureCodingPolicy";
+    boolean success = false;
+    try {
+      erasureCoding.setErasureCodingPolicy(src, ecPolicyName);
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, src, null, null);
+    }
   }
 
   @Override
   public void unsetErasureCodingPolicy(String src) throws IOException {
-    erasureCoding.unsetErasureCodingPolicy(src);
+    final String operationName = "unsetErasureCodingPolicy";
+    boolean success = false;
+    try {
+      erasureCoding.unsetErasureCodingPolicy(src);
+      success = true;
+    } finally {
+      logAuditEvent(success, operationName, src, null, null);
+    }
   }
 
   @Override
@@ -1778,6 +2447,7 @@ public class RouterClientProtocol implements ClientProtocol {
       EnumSet<OpenFilesIterator.OpenFilesType> openFilesTypes, String path)
           throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ, false);
+    logAuditEvent(true, "listOpenFiles", null);
     return null;
   }
 
@@ -1789,6 +2459,7 @@ public class RouterClientProtocol implements ClientProtocol {
   @Override
   public void satisfyStoragePolicy(String path) throws IOException {
     storagePolicy.satisfyStoragePolicy(path);
+    logAuditEvent(true, "satisfyStoragePolicy", path, null, null);
   }
 
   @Override
@@ -2133,9 +2804,14 @@ public class RouterClientProtocol implements ClientProtocol {
       RemoteMethod method = new RemoteMethod("getListing",
           new Class<?>[] {String.class, startAfter.getClass(), boolean.class},
           new RemoteParam(), startAfter, needLocation);
-      List<RemoteResult<RemoteLocation, DirectoryListing>> listings = rpcClient
-          .invokeConcurrent(locations, method, false, -1,
-              DirectoryListing.class);
+      final List<RemoteResult<RemoteLocation, DirectoryListing>> listings ;
+      try {
+        listings = rpcClient.invokeConcurrent(locations, method, false, -1,
+            DirectoryListing.class);
+      } catch (AccessControlException e) {
+        logAuditEvent(false, "getListing", src);
+        throw e;
+      }
       return listings;
     } catch (RouterResolveException e) {
       LOG.debug("Cannot get locations for {}, {}.", src, e.getMessage());
