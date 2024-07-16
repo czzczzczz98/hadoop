@@ -52,9 +52,8 @@ public class TestRouterAuditLog {
   /** Random Router for this federated cluster. */
   private MiniRouterDFSCluster.RouterContext router;
 
-
-  @BeforeClass
-  public static void globalSetUp() throws Exception {
+  @Before
+  public void testSetup() throws Exception {
     Configuration namenodeConf = new Configuration();
     namenodeConf.setBoolean(DFSConfigKeys.HADOOP_CALLER_CONTEXT_ENABLED_KEY,
         true);
@@ -81,10 +80,6 @@ public class TestRouterAuditLog {
     cluster.registerNamenodes();
     cluster.waitNamenodeRegistration();
     auditlog = LogCapturer.captureLogs(RouterRpcServer.auditLog);
-  }
-
-  @Before
-  public void testSetup() throws Exception {
     // Create mock locations
     cluster.installMockLocations();
 
