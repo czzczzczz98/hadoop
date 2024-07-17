@@ -17,6 +17,13 @@
  */
 package org.apache.hadoop.hdfs.server.federation.router;
 
+import static org.apache.commons.lang3.StringEscapeUtils.escapeJava;
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_ENABLED_DEFAULT;
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_ENABLED_KEY;
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_MAX_SIZE_DEFAULT;
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_MAX_SIZE_KEY;
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_SIGNATURE_MAX_SIZE_DEFAULT;
+import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_CALLER_CONTEXT_SIGNATURE_MAX_SIZE_KEY;
 import static org.apache.hadoop.fs.CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHORIZATION;
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_ROUTER_HANDLER_COUNT_DEFAULT;
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_ROUTER_HANDLER_COUNT_KEY;
@@ -26,6 +33,9 @@ import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_ROUTER_READER_COUNT_KEY;
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_ROUTER_READER_QUEUE_SIZE_DEFAULT;
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_ROUTER_READER_QUEUE_SIZE_KEY;
+import static org.apache.hadoop.hdfs.server.namenode.top.metrics.TopMetrics.TOPMETRICS_METRICS_SOURCE_NAME;
+
+import org.apache.hadoop.thirdparty.com.google.common.collect.Lists;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -33,7 +43,9 @@ import java.lang.reflect.Array;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -41,7 +53,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.net.InetAddress;
 
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.crypto.CryptoProtocolVersion;
 import org.apache.hadoop.fs.BatchedRemoteIterator.BatchedEntries;
@@ -50,6 +66,7 @@ import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FileAlreadyExistsException;
+import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FsServerDefaults;
 import org.apache.hadoop.fs.Options;
 import org.apache.hadoop.fs.QuotaUsage;
@@ -109,6 +126,7 @@ import org.apache.hadoop.hdfs.protocolPB.RouterPolicyProvider;
 import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
 import org.apache.hadoop.hdfs.security.token.block.ExportedBlockKeys;
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
+import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenSecretManager;
 import org.apache.hadoop.hdfs.server.federation.metrics.FederationRPCMetrics;
 import org.apache.hadoop.hdfs.server.federation.resolver.ActiveNamenodeResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.FederationNamespaceInfo;
@@ -120,10 +138,15 @@ import org.apache.hadoop.hdfs.server.federation.store.StateStoreUnavailableExcep
 import org.apache.hadoop.hdfs.server.federation.store.records.MountTable;
 import org.apache.hadoop.hdfs.server.federation.router.security.RouterSecurityManager;
 import org.apache.hadoop.hdfs.server.namenode.CheckpointSignature;
+import org.apache.hadoop.hdfs.server.namenode.AuditLogger;
+import org.apache.hadoop.hdfs.server.namenode.DefaultAuditLogger;
 import org.apache.hadoop.hdfs.server.namenode.LeaseExpiredException;
 import org.apache.hadoop.hdfs.server.namenode.NameNode.OperationCategory;
 import org.apache.hadoop.hdfs.server.namenode.NotReplicatedYetException;
 import org.apache.hadoop.hdfs.server.namenode.SafeModeException;
+import org.apache.hadoop.hdfs.server.namenode.top.TopAuditLogger;
+import org.apache.hadoop.hdfs.server.namenode.top.TopConf;
+import org.apache.hadoop.hdfs.server.namenode.top.metrics.TopMetrics;
 import org.apache.hadoop.hdfs.server.protocol.BlocksWithLocations;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeStorageReport;
 import org.apache.hadoop.hdfs.server.protocol.NamenodeCommand;
@@ -133,27 +156,33 @@ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
 import org.apache.hadoop.hdfs.server.protocol.RemoteEditLogManifest;
 import org.apache.hadoop.io.EnumSetWritable;
 import org.apache.hadoop.io.Text;
+import org.apache.hadoop.ipc.CallerContext;
 import org.apache.hadoop.ipc.ProtobufRpcEngine2;
 import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.ipc.RPC.Server;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.ipc.RetriableException;
 import org.apache.hadoop.ipc.StandbyException;
+import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
 import org.apache.hadoop.net.NodeBase;
 import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.RefreshUserMappingsProtocol;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod;
 import org.apache.hadoop.security.proto.RefreshUserMappingsProtocolProtos;
 import org.apache.hadoop.security.protocolPB.RefreshUserMappingsProtocolPB;
 import org.apache.hadoop.security.protocolPB.RefreshUserMappingsProtocolServerSideTranslatorPB;
 import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.security.token.TokenIdentifier;
 import org.apache.hadoop.service.AbstractService;
 import org.apache.hadoop.tools.GetUserMappingsProtocol;
 import org.apache.hadoop.tools.proto.GetUserMappingsProtocolProtos;
 import org.apache.hadoop.tools.protocolPB.GetUserMappingsProtocolPB;
 import org.apache.hadoop.tools.protocolPB.GetUserMappingsProtocolServerSideTranslatorPB;
 import org.apache.hadoop.util.ReflectionUtils;
-import org.slf4j.Logger;
+import org.apache.log4j.Appender;
+import org.apache.log4j.AsyncAppender;
+import org.apache.log4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
@@ -170,9 +199,25 @@ import org.apache.hadoop.thirdparty.protobuf.BlockingService;
 public class RouterRpcServer extends AbstractService implements ClientProtocol,
     NamenodeProtocol, RefreshUserMappingsProtocol, GetUserMappingsProtocol {
 
-  private static final Logger LOG =
+  private static final org.slf4j.Logger LOG =
       LoggerFactory.getLogger(RouterRpcServer.class);
 
+  /**
+   * Logger for audit events, noting successful RouterRpcServer operations.
+   * Emits to RouterRpcServer.audit at INFO. Each event causes a set of
+   * tab-separated
+   * <code>key=value</code> pairs to be written for the following properties:
+   * <code>
+   * ugi=&lt;ugi in RPC&gt;
+   * ip=&lt;remote IP&gt;
+   * cmd=&lt;command&gt;
+   * src=&lt;src path&gt;
+   * dst=&lt;dst path (optional)&gt;
+   * perm=&lt;permissions (optional)&gt;
+   * </code>
+   */
+  public static final Log auditLog = LogFactory.getLog(
+      RouterRpcServer.class.getName() + ".audit");
 
   /** Configuration for the RPC server. */
   private Configuration conf;
@@ -218,6 +263,9 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
   /** Super user credentials that a thread may use. */
   private static final ThreadLocal<UserGroupInformation> CUR_USER =
       new ThreadLocal<>();
+  private static List<AuditLogger> auditLoggers;
+  private final TopConf topConf;
+  private TopMetrics topMetrics;
 
   /**
    * Construct a router RPC server.
@@ -237,6 +285,12 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
     this.router = router;
     this.namenodeResolver = nnResolver;
     this.subclusterResolver = fileResolver;
+
+    if (this.conf.getBoolean(RBFConfigKeys.DFS_ROUTER_AUDIT_LOG_ASYNC_KEY,
+        RBFConfigKeys.DFS_ROUTER_AUDIT_LOG_ASYNC_DEFAULT)) {
+      LOG.info("Enabling async auditlog");
+      enableAsyncAuditLog();
+    }
 
     // RPC server settings
     int handlerCount = this.conf.getInt(DFS_ROUTER_HANDLER_COUNT_KEY,
@@ -352,6 +406,9 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
       this.rpcMonitor = null;
     }
 
+    this.topConf = new TopConf(this.conf);
+    RouterRpcServer.auditLoggers = initAuditLoggers(this.conf);
+
     // Create the client
     this.rpcClient = new RouterRpcClient(this.conf, this.router,
         this.namenodeResolver, this.rpcMonitor);
@@ -461,6 +518,10 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
    */
   public InetSocketAddress getRpcAddress() {
     return rpcAddress;
+  }
+
+  public static List<AuditLogger> getAuditLogger(){
+    return auditLoggers;
   }
 
   /**
@@ -1790,6 +1851,180 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
           LOG.debug("{} is in multiple subclusters", nodeId);
         }
       }
+    }
+  }
+
+
+  private List<AuditLogger> initAuditLoggers(Configuration conf) {
+    // Initialize the custom access loggers if configured.
+    Collection<String> alClasses =
+        conf.getTrimmedStringCollection(
+            RBFConfigKeys.DFS_ROUTER_AUDIT_LOGGERS_KEY);
+    List<AuditLogger> auditLoggers = Lists.newArrayList();
+    if (alClasses != null && !alClasses.isEmpty()) {
+      for (String className : alClasses) {
+        try {
+          AuditLogger logger;
+          if (RBFConfigKeys.DFS_ROUTER_DEFAULT_AUDIT_LOGGER_NAME
+              .equals(className)) {
+            logger = new RouterRpcServerAuditLogger();
+          } else {
+            logger = (AuditLogger) Class.forName(className).newInstance();
+          }
+          logger.initialize(conf);
+          auditLoggers.add(logger);
+        } catch (RuntimeException re) {
+          throw re;
+        } catch (Exception e) {
+          throw new RuntimeException(e);
+        }
+      }
+    }
+
+    // Make sure there is at least one logger installed.
+    if (auditLoggers.isEmpty()) {
+      auditLoggers.add(new RouterRpcServerAuditLogger());
+    }
+
+    // Add audit logger to calculate top users
+    if (topConf.isEnabled) {
+      topMetrics = new TopMetrics(conf, topConf.nntopReportingPeriodsMs);
+      if (DefaultMetricsSystem.instance().getSource(
+          TOPMETRICS_METRICS_SOURCE_NAME) == null) {
+        DefaultMetricsSystem.instance().register(TOPMETRICS_METRICS_SOURCE_NAME,
+            "Top N operations by user", topMetrics);
+      }
+      auditLoggers.add(new TopAuditLogger(topMetrics));
+    }
+
+    return Collections.unmodifiableList(auditLoggers);
+  }
+
+  /**
+   * RouterRpcServer AuditLogger implementation; used when no access logger is defined in the config
+   * file. It can also be explicitly listed in the config file.
+   */
+  @VisibleForTesting
+  static class RouterRpcServerAuditLogger extends DefaultAuditLogger {
+
+    @Override
+    public void initialize(Configuration conf) {
+      isCallerContextEnabled = conf.getBoolean(
+          HADOOP_CALLER_CONTEXT_ENABLED_KEY,
+          HADOOP_CALLER_CONTEXT_ENABLED_DEFAULT);
+      callerContextMaxLen = conf.getInt(
+          HADOOP_CALLER_CONTEXT_MAX_SIZE_KEY,
+          HADOOP_CALLER_CONTEXT_MAX_SIZE_DEFAULT);
+      callerSignatureMaxLen = conf.getInt(
+          HADOOP_CALLER_CONTEXT_SIGNATURE_MAX_SIZE_KEY,
+          HADOOP_CALLER_CONTEXT_SIGNATURE_MAX_SIZE_DEFAULT);
+      logTokenTrackingId = conf.getBoolean(
+          RBFConfigKeys.DFS_ROUTER_AUDIT_LOG_TOKEN_TRACKING_ID_KEY,
+          RBFConfigKeys.DFS_ROUTER_AUDIT_LOG_TOKEN_TRACKING_ID_DEFAULT);
+
+      debugCmdSet.addAll(Arrays.asList(conf.getTrimmedStrings(
+          RBFConfigKeys.DFS_ROUTER_AUDIT_LOG_DEBUG_CMDLIST)));
+    }
+
+    @Override
+    public void logAuditEvent(boolean succeeded, String userName,
+        InetAddress addr, String cmd, String src, String dst,
+        FileStatus status, CallerContext callerContext,
+        UserGroupInformation ugi,
+        DelegationTokenSecretManager dtSecretManager) {
+
+      if (auditLog.isDebugEnabled() ||
+          (auditLog.isInfoEnabled() && !debugCmdSet.contains(cmd))) {
+        final StringBuilder sb = STRING_BUILDER.get();
+        src = escapeJava(src);
+        dst = escapeJava(dst);
+        sb.setLength(0);
+        sb.append("allowed=").append(succeeded).append("\t");
+        sb.append("ugi=").append(userName).append("\t");
+        sb.append("ip=").append(addr).append("\t");
+        sb.append("cmd=").append(cmd).append("\t");
+        sb.append("src=").append(src).append("\t");
+        sb.append("dst=").append(dst).append("\t");
+        if (null == status) {
+          sb.append("perm=null");
+        } else {
+          sb.append("perm=");
+          sb.append(status.getOwner()).append(":");
+          sb.append(status.getGroup()).append(":");
+          sb.append(status.getPermission());
+        }
+        if (logTokenTrackingId) {
+          sb.append("\t").append("trackingId=");
+          String trackingId = null;
+          if (ugi != null && dtSecretManager != null
+              && ugi.getAuthenticationMethod() == AuthenticationMethod.TOKEN) {
+            for (TokenIdentifier tid : ugi.getTokenIdentifiers()) {
+              if (tid instanceof DelegationTokenIdentifier) {
+                DelegationTokenIdentifier dtid =
+                    (DelegationTokenIdentifier) tid;
+                trackingId = dtSecretManager.getTokenTrackingId(dtid);
+                break;
+              }
+            }
+          }
+          sb.append(trackingId);
+        }
+        sb.append("\t").append("proto=");
+        sb.append(Server.getProtocol());
+        if (isCallerContextEnabled &&
+            callerContext != null &&
+            callerContext.isContextValid()) {
+          sb.append("\t").append("callerContext=");
+          if (callerContext.getContext().length() > callerContextMaxLen) {
+            sb.append(callerContext.getContext().substring(0,
+                callerContextMaxLen));
+          } else {
+            sb.append(callerContext.getContext());
+          }
+          if (callerContext.getSignature() != null &&
+              callerContext.getSignature().length > 0 &&
+              callerContext.getSignature().length <= callerSignatureMaxLen) {
+            sb.append(":");
+            sb.append(new String(callerContext.getSignature(),
+                CallerContext.SIGNATURE_ENCODING));
+          }
+        }
+        logAuditMessage(sb.toString());
+      }
+    }
+
+    @Override
+    public void logAuditEvent(boolean succeeded, String userName,
+        InetAddress addr, String cmd, String src, String dst,
+        FileStatus status, UserGroupInformation ugi,
+        DelegationTokenSecretManager dtSecretManager) {
+      this.logAuditEvent(succeeded, userName, addr, cmd, src, dst, status,
+          null /*CallerContext*/, ugi, dtSecretManager);
+    }
+
+    public void logAuditMessage(String message) {
+      auditLog.info(message);
+    }
+  }
+
+  private static void enableAsyncAuditLog() {
+    if (!(auditLog instanceof Log4JLogger)) {
+      LOG.warn("Log4j is required to enable async auditlog");
+      return;
+    }
+    Logger logger = ((Log4JLogger) auditLog).getLogger();
+    @SuppressWarnings("unchecked")
+    List<Appender> appenders = Collections.list(logger.getAllAppenders());
+    // failsafe against trying to async it more than once
+    if (!appenders.isEmpty() && !(appenders.get(0) instanceof AsyncAppender)) {
+      AsyncAppender asyncAppender = new AsyncAppender();
+      // change logger to have an async appender containing all the
+      // previously configured appenders
+      for (Appender appender : appenders) {
+        logger.removeAppender(appender);
+        asyncAppender.addAppender(appender);
+      }
+      logger.addAppender(asyncAppender);
     }
   }
 

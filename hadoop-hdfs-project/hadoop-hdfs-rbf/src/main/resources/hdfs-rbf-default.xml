@@ -645,4 +645,36 @@
     </description>
   </property>
 
+  <property>
+    <name>dfs.router.audit.loggers</name>
+    <value></value>
+    <description>
+      Optional comma separated list of custom access loggers
+    </description>
+  </property>
+
+  <property>
+    <name>dfs.router.audit.log.debug.cmdlist</name>
+    <value></value>
+    <description>
+      A comma separated string representing optional commands list to router audit log
+    </description>
+  </property>
+
+  <property>
+    <name>dfs.router.audit.log.async</name>
+    <value>false</value>
+    <description>
+      Enables async auditlog
+    </description>
+  </property>
+
+  <property>
+    <name>dfs.router.audit.log.token.tracking.id</name>
+    <value>false</value>
+    <description>
+      Adds a tracking ID for all audit log events
+    </description>
+  </property>
+
 </configuration>
